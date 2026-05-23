@@ -1,7 +1,5 @@
 # ONE-SHOT AI IMPLEMENTATION RUNBOOK: CODEX BYOK WITH DEEPSEEK
 
-> **Credits:** All primary credit goes to [0xSero's codex-shim](https://github.com/0xSero/codex-shim) who did the heavy lifting to build the core proxy server! This runbook exists strictly to automate the installation of that shim using AI, while applying a few necessary edge-case patches for DeepSeek compatibility and Codex UI restrictions.
-
 **TARGET AUDIENCE:** AI Coding Assistants (Cursor, Copilot, etc.)  
 **MISSION:** You are tasked with patching the `codex-shim` and the Codex Desktop app to fully support DeepSeek BYOK models. The user wants this done flawlessly on the first try. You MUST follow these exact steps and code snippets. Do not deviate.
 
@@ -217,3 +215,167 @@ echo "Successfully code-signed app."
 2. Ensure `~/.factory/settings.json` is configured with DeepSeek credentials.
 3. Launch the app: `open ~/Applications/Codex.app`.
 4. DeepSeek will now perfectly handle function calling, reasoning, and context!
+
+---
+
+## APPENDIX: Troubleshooting OpenAI API Error "insufficient tool messages following tool_calls message"
+
+### 1. What Is This Error?
+
+This is a **message-ordering validation error** thrown by OpenAI's Chat Completions API. It means the `messages` array you sent to the API has a structural violation: an **assistant message containing `tool_calls`** that isn't immediately and completely followed by matching **`tool`-role response messages**.
+
+OpenAI enforces a strict parent-child relationship in the conversation history:
+
+```
+assistant (with tool_calls)  →  tool (for call_1)  →  tool (for call_2)  →  ...  →  assistant/user/next message
+```
+
+If even one tool call ID in that assistant message has no corresponding `tool` message, the entire request is rejected with this error.
+
+### 2. Why Does It Happen? (Root Causes)
+
+The error is caused by one of these scenarios:
+
+| Cause | What Happens |
+|-------|-------------|
+| **Missing tool response** | The assistant asked for 2 function calls, but you only added 1 `tool` message to the history before the next request. |
+| **Tool responses appended after another message** | You inserted a `user`, `system`, or another `assistant` message between the assistant's tool_calls message and the tool responses. The API requires tool responses **immediately** after the assistant message that requested them. |
+| **Streaming truncation** | You're using `stream=True`. Tool call deltas arrive across multiple chunks. If you stop collecting chunks early or assemble the final assistant message incorrectly, some `tool_call_id` values get lost. |
+| **Race conditions / parallel execution** | You fire multiple tool calls in parallel but one fails silently. You then push only the successful response(s) into the messages array, leaving orphaned call IDs. |
+| **Manual message construction** | You hand-build the messages array and forget to attach a tool response before the next API call. |
+| **Logging / replay** | You save messages to a database, trim or filter them, and replay a subset that breaks the pairing. |
+
+### 3. How to Fix It
+
+#### Step 1: Validate the pairing before every API call
+
+```python
+def validate_tool_call_pairing(messages):
+    """Check that every assistant tool_call has a matching tool response."""
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            expected_ids = {tc["id"] for tc in msg["tool_calls"]}
+            found_ids = set()
+            j = i + 1
+            # Collect all immediate tool responses
+            while j < len(messages) and messages[j]["role"] == "tool":
+                found_ids.add(messages[j]["tool_call_id"])
+                j += 1
+            missing = expected_ids - found_ids
+            if missing:
+                raise ValueError(f"Missing tool responses for: {missing}")
+```
+
+#### Step 2: Always pair tool calls with responses immediately
+
+```python
+# Correct pattern
+response = client.chat.completions.create(model="gpt-4o", messages=messages)
+
+msg = response.choices[0].message
+
+if msg.tool_calls:
+    # 1. Append the assistant message FIRST
+    messages.append(msg.model_dump())
+
+    # 2. THEN append each tool response BEFORE any other message
+    for tool_call in msg.tool_calls:
+        result = execute_tool(tool_call.function.name, tool_call.function.arguments)
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": json.dumps(result)
+        })
+
+    # 3. NOW you can call the API again
+    response = client.chat.completions.create(model="gpt-4o", messages=messages)
+```
+
+#### Step 3: Handle streaming correctly
+
+When streaming, tool calls arrive incrementally — accumulate them fully before appending:
+
+```python
+collected_tool_calls = {}  # index → {id, name, arguments}
+
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    for tc in delta.tool_calls or []:
+        idx = tc.index
+        if idx not in collected_tool_calls:
+            collected_tool_calls[idx] = {"id": tc.id or "", "function": {"name": "", "arguments": ""}}
+        if tc.id:
+            collected_tool_calls[idx]["id"] = tc.id
+        if tc.function:
+            if tc.function.name:
+                collected_tool_calls[idx]["function"]["name"] += tc.function.name
+            if tc.function.arguments:
+                collected_tool_calls[idx]["function"]["arguments"] += tc.function.arguments
+
+# Now build the assistant message with ALL tool calls intact
+assistant_msg = {
+    "role": "assistant",
+    "content": None,
+    "tool_calls": list(collected_tool_calls.values())
+}
+messages.append(assistant_msg)
+
+# Then add all tool responses
+for idx in sorted(collected_tool_calls):
+    tc = collected_tool_calls[idx]
+    result = execute_tool(tc["function"]["name"], tc["function"]["arguments"])
+    messages.append({
+        "role": "tool",
+        "tool_call_id": tc["id"],
+        "content": json.dumps(result)
+    })
+```
+
+### 4. Other Important Things to Know
+
+#### Invalid Ordering (breaks)
+```
+[{"role": "assistant", "tool_calls": [{"id": "call_1"}, {"id": "call_2"}]}]
+[{"role": "tool", "tool_call_id": "call_1", "content": "..."}]
+[{"role": "user", "content": "Hey!"}]          ← ❌ "call_2" never responded, AND a user message was injected
+```
+
+#### Valid Ordering (works)
+```
+[{"role": "assistant", "tool_calls": [{"id": "call_1"}, {"id": "call_2"}]}]
+[{"role": "tool", "tool_call_id": "call_1", "content": "..."}]
+[{"role": "tool", "tool_call_id": "call_2", "content": "..."}]
+[{"role": "user", "content": "Hey!"}]           ← ✅ All tool calls resolved first
+```
+
+#### Edge Cases
+
+- **Parallel tool calls with failures**: If one tool execution throws an exception, you must **still** provide a `tool` message for that call ID. Return the error as the content, e.g., `{"error": "timeout"}`. Never leave it out.
+- **Assistant messages with `content` + `tool_calls`**: The assistant message may have both text `content` and `tool_calls`. The same rule applies — every tool_call_id still needs a response.
+- **Re-submitting old messages**: If you trim conversation history for cost/context reasons, never cut between an assistant tool_calls message and its tool responses. Trim in complete "blocks."
+- **API version differences**: This validation was tightened around early 2024. Older libraries (e.g., `openai<1.0`) might not enforce it client-side, but the server will reject the request.
+
+#### Quick Debugging Snippet
+
+Add this right before your API call:
+
+```python
+for i, m in enumerate(messages):
+    if m.get("role") == "assistant" and m.get("tool_calls"):
+        for tc in m["tool_calls"]:
+            found = any(
+                msg.get("tool_call_id") == tc["id"]
+                for msg in messages[i+1:i+1+len(m["tool_calls"])]
+            )
+            if not found:
+                print(f"⚠️ Orphaned tool_call_id: {tc['id']} (index {i})")
+```
+
+### 5. TL;DR Summary
+
+| Aspect | Detail |
+|--------|--------|
+| **What the error means** | An assistant message with `tool_calls` exists in your messages array, but not all those call IDs have a corresponding `tool`-role response message. |
+| **Why it happens** | Missing, misordered, or truncated tool responses; streaming bugs; silent failures; bad message trimming. |
+| **The fix** | Ensure every `tool_call_id` gets a `tool` message placed **immediately** after the assistant message, with no other messages in between, before the next API call. |
+| **Golden rule** | Treat `assistant(tool_calls)` + its `tool` responses as an **atomic, inseparable block**. Never split this block. |
