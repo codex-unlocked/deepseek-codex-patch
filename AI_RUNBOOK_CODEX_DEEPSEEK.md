@@ -48,14 +48,15 @@ In `_responses_input_to_messages`, find the block handling messages. Update it t
 ```
 
 **Action 2: Reattach & Combine Reasoning Content**
-Replace the entire `responses_to_chat` function with the following bulletproof logic. This decodes the `encrypted_content`, attaches it as `reasoning_content`, AND strictly merges consecutive assistant messages (which DeepSeek demands):
+Replace the entire `responses_to_chat` function with the following bulletproof logic. This decodes the `encrypted_content`, adds a fallback to extract text from `summary`, attaches it as `reasoning_content`, ensures proper tool_call message sequencing, and prevents DeepSeek crashes by padding missing reasoning blocks.
 ```python
 def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, Any]:
+    import sys, json
+    print("DEBUG INCOMING BODY:", json.dumps(body), file=sys.stderr)
     messages = []
     instructions = body.get("instructions")
     if instructions:
         messages.append({"role": "system", "content": _content_to_text(instructions)})
-    
     pending_reasoning = ""
     for raw_m in _responses_input_to_messages(body.get("input")):
         m = dict(raw_m)
@@ -63,6 +64,11 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, An
             decoded = _decode_thinking_blob(m.get("encrypted_content"))
             if decoded and isinstance(decoded, dict) and decoded.get("thinking"):
                 pending_reasoning += decoded["thinking"]
+            else:
+                for summary in m.get("summary") or []:
+                    text = summary.get("text") if isinstance(summary, dict) else None
+                    if text:
+                        pending_reasoning += text
             # Insert sentinel so merge logic does not fuse assistant
             # messages from different conversation turns.
             messages.append({"_SENTINEL": True, "role": "_sentinel"})
@@ -72,15 +78,18 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, An
             if m.get("role") == "assistant":
                 m["reasoning_content"] = pending_reasoning
                 pending_reasoning = ""
-            # If role is not assistant, keep pending_reasoning for the next assistant message.
+            # If role is not assistant (e.g. tool, user), keep
+            # pending_reasoning for the next assistant message.
             
-        # Find real merge target: skip sentinel entries.
+        # Only merge when the *immediate* predecessor is an assistant
+        # message.  If a _SENTINEL sits between them, the two assistant
+        # messages belong to different reasoning phases and MUST NOT be
+        # merged — fusing their tool_calls would break DeepSeek's
+        # requirement that every tool_calls message is followed by
+        # matching tool-result messages.
         merge_idx = len(messages) - 1
-        while merge_idx >= 0 and messages[merge_idx].get("_SENTINEL"):
-            merge_idx -= 1
-
-        if merge_idx >= 0 and messages[merge_idx].get("role") == "assistant" and m.get("role") == "assistant":
-            # Combine consecutive assistant messages to satisfy DeepSeek
+        if merge_idx >= 0 and not messages[merge_idx].get("_SENTINEL") and messages[merge_idx].get("role") == "assistant" and m.get("role") == "assistant":
+            # Combine them
             if m.get("content"):
                 if messages[merge_idx].get("content"):
                     messages[merge_idx]["content"] += "\n" + m["content"]
@@ -89,13 +98,36 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, An
             if m.get("tool_calls"):
                 if "tool_calls" not in messages[merge_idx]:
                     messages[merge_idx]["tool_calls"] = []
-                messages[merge_idx]["tool_calls"].extend(m["tool_calls"])
+                # Deduplicate by id: only add tool_calls whose id is not
+                # already present in the merged message.  Without this,
+                # two assistant messages referencing the same call_id
+                # (common with the "call_0" fallback) produce duplicate
+                # entries that the downstream validation misses because it
+                # only checks set membership, not count.  This causes
+                # "insufficient tool messages" from strict APIs (DeepSeek).
+                existing_ids = {tc["id"] for tc in messages[merge_idx]["tool_calls"] if tc.get("id")}
+                for tc in m["tool_calls"]:
+                    if tc.get("id") not in existing_ids:
+                        messages[merge_idx]["tool_calls"].append(tc)
+                        if tc.get("id"):
+                            existing_ids.add(tc["id"])
             if m.get("reasoning_content"):
                 if "reasoning_content" not in messages[merge_idx]:
                     messages[merge_idx]["reasoning_content"] = m["reasoning_content"]
                 else:
                     messages[merge_idx]["reasoning_content"] += "\n" + m["reasoning_content"]
         else:
+            # Deduplicate tool_calls within a single message too.
+            # The "call_0" fallback in _responses_input_to_messages can
+            # produce multiple entries with the same id.
+            if m.get("tool_calls"):
+                seen = set()
+                deduped = []
+                for tc in m["tool_calls"]:
+                    if tc.get("id") not in seen:
+                        seen.add(tc["id"])
+                        deduped.append(tc)
+                m["tool_calls"] = deduped
             messages.append(m)
 
     if pending_reasoning:
@@ -108,8 +140,57 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, An
         else:
             messages.append({"role": "assistant", "content": "", "reasoning_content": pending_reasoning})
 
-    # Remove sentinel entries before sending to upstream API.
-    messages = [m for m in messages if not m.get("_SENTINEL")]
+    # Validate and cleanup tool_calls to satisfy strict APIs (like DeepSeek).
+    # Every tool_call in an assistant message MUST have a corresponding tool message.
+    # Use Counter (not set) so N tool_calls sharing the same id require N tool
+    # messages.  A plain set would let duplicate ids all pass when fewer tool
+    # messages exist, triggering "insufficient tool messages" errors.
+    from collections import Counter
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            available = Counter[str]()
+            for j in range(i + 1, len(messages)):
+                if messages[j].get("role") == "tool":
+                    if "tool_call_id" in messages[j]:
+                        available[messages[j]["tool_call_id"]] += 1
+                elif messages[j].get("role") not in ("tool", "_sentinel"):
+                    break
+
+            consumed = Counter[str]()
+            valid_tool_calls = []
+            for tc in msg["tool_calls"]:
+                tc_id = tc.get("id") or ""
+                if tc_id and available.get(tc_id, 0) > consumed.get(tc_id, 0):
+                    consumed[tc_id] += 1
+                    valid_tool_calls.append(tc)
+            if not valid_tool_calls:
+                del msg["tool_calls"]
+                if not msg.get("content") and not msg.get("reasoning_content"):
+                    msg["content"] = "..." # dummy content to prevent empty message error
+            else:
+                msg["tool_calls"] = valid_tool_calls
+
+    # Remove sentinel entries and orphaned tool messages before sending to upstream API.
+    final_messages = []
+    valid_tool_call_ids = set()
+    for m in messages:
+        if m.get("_SENTINEL"):
+            continue
+        if m.get("role") == "assistant" and "tool_calls" in m:
+            for tc in m["tool_calls"]:
+                valid_tool_call_ids.add(tc.get("id"))
+        if m.get("role") == "tool":
+            if m.get("tool_call_id") not in valid_tool_call_ids:
+                continue # drop orphaned tool message
+                
+        # Ensure deepseek models always have reasoning_content in assistant messages
+        if m.get("role") == "assistant" and "deepseek" in upstream_model.lower():
+            if "reasoning_content" not in m:
+                m["reasoning_content"] = ""
+                
+        final_messages.append(m)
+    
+    messages = final_messages
 
     chat: dict[str, Any] = {
         "model": upstream_model,
@@ -126,7 +207,77 @@ def responses_to_chat(body: dict[str, Any], upstream_model: str) -> dict[str, An
     if tools:
         chat["tools"] = tools
         _copy_if_present(body, chat, "tool_choice")
+        
+    import sys
+    print("DEBUG OUTGOING CHAT PAYLOAD:", json.dumps(chat), file=sys.stderr)
     return chat
+```
+
+**Action 3: Preserve `<think>` Blocks in Non-Streaming Responses**
+Replace `chat_completion_to_response` to ensure that non-streaming background actions (like commit generation) don't permanently drop the reasoning content from the chat history:
+```python
+def chat_completion_to_response(payload: dict[str, Any], requested_model: str) -> dict[str, Any]:
+    choice = (payload.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    output: list[dict[str, Any]] = []
+    
+    raw_content = message.get("content") or ""
+    text = strip_think(raw_content)
+    
+    reasoning = message.get("reasoning_content")
+    if not reasoning:
+        match = THINK_RE.search(raw_content)
+        if match:
+            reasoning = match.group(0)
+            reasoning = reasoning.removeprefix("<think>").removesuffix("</think>").strip("\n")
+            
+    if reasoning:
+        import base64
+        import json
+        payload_data = {"type": "thinking", "thinking": reasoning, "signature": ""}
+        raw = json.dumps(payload_data, separators=(",", ":")).encode("utf-8")
+        encrypted = "anthropic-thinking-v1:" + base64.urlsafe_b64encode(raw).decode("ascii")
+        output.append(
+            {
+                "id": "rs_0",
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": reasoning}],
+                "encrypted_content": encrypted,
+            }
+        )
+
+    if text:
+        output.append(
+            {
+                "id": "msg_0",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+        )
+    for call in message.get("tool_calls") or []:
+        fn = call.get("function") or {}
+        output.append(
+            {
+                "id": call.get("id", "call_0"),
+                "type": "function_call",
+                "status": "completed",
+                "call_id": call.get("id", "call_0"),
+                "name": fn.get("name", ""),
+                "arguments": fn.get("arguments", ""),
+            }
+        )
+    return {
+        "id": payload.get("id", "resp_chat"),
+        "object": "response",
+        "created_at": payload.get("created", 0),
+        "status": "completed",
+        "model": requested_model,
+        "output": output,
+        "usage": payload.get("usage"),
+    }
 ```
 
 ---
